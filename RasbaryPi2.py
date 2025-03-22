@@ -34,10 +34,71 @@ class SoundClassifier:
         self.last_predictions = {}
         self.sample_rates = {}
         
+        # Инициализация путей к данным
+        self.data_dir = DATA_DIRS['train']
+        self.valid_dir = DATA_DIRS['valid']
+        self.test_dir = DATA_DIRS['test']
+        
         if not self.load_model():  # Попытка загрузки модели
             self.init_training()    # Запуск обучения если модель не найдена
             
         self.init_network()
+
+    # 🔄 Перемещен метод save_model выше load_model
+    def save_model(self):
+        """Сохранение модели на диск"""
+        try:
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'le_classes': self.le.classes_,
+                'sample_rates': self.sample_rates,
+                'input_size': N_MFCC,
+                'num_classes': len(self.le.classes_)
+            }, MODEL_PATH)
+            print(f"Модель сохранена в {MODEL_PATH}")
+        except Exception as e:
+            print(f"Ошибка сохранения: {str(e)}")
+            raise
+
+    def load_model(self):
+        """Загрузка модели с диска"""
+        if os.path.exists(MODEL_PATH):
+            try:
+                checkpoint = torch.load(
+                    MODEL_PATH,
+                    map_location='cpu',
+                    weights_only=False
+                )
+                self.le.classes_ = checkpoint['le_classes']
+                self.sample_rates = checkpoint.get('sample_rates', {})
+                
+                self.model = nn.Sequential(
+                    nn.Linear(checkpoint['input_size'], 512),
+                    nn.BatchNorm1d(512),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT_RATE),
+                    nn.Linear(512, 256),
+                    nn.BatchNorm1d(256),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT_RATE),
+                    nn.Linear(256, 128),
+                    nn.BatchNorm1d(128),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT_RATE),
+                    nn.Linear(128, 64),
+                    nn.BatchNorm1d(64),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT_RATE),
+                    nn.Linear(64, checkpoint['num_classes'])
+                )
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"Модель загружена из {MODEL_PATH}")
+                return True
+            except Exception as e:
+                print(f"Ошибка загрузки модели: {str(e)}")
+                return False
+        print("Файл модели не найден")
+        return False
 
     def init_training(self):
         """Инициализация процесса обучения при отсутствии модели"""
@@ -48,16 +109,15 @@ class SoundClassifier:
         try:
             self.load_data()
             self.create_model()
-            self.train(num_epochs=20)
-            self.save_model()
+            self.train(num_epochs=250)
+            self.save_model()  # 🔄 Исправленный вызов
             print("\nОбучение успешно завершено!\n")
-            self.load_model()  # Загружаем обученную модель
+            self.load_model()
         except Exception as e:
             print(f"Критическая ошибка при обучении: {str(e)}")
             exit(1)
 
     def load_data(self):
-        """Загрузка данных из директорий"""
         def load_from_dir(dir_path):
             if not os.path.exists(dir_path):
                 raise FileNotFoundError(f"Директория {dir_path} не найдена")
@@ -93,7 +153,7 @@ class SoundClassifier:
                             audio, sr = librosa.load(file_path, sr=None, mono=True)
                             if sr != TARGET_SAMPLE_RATE:
                                 audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SAMPLE_RATE)
-                            
+                                
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
                                 mfcc = librosa.feature.mfcc(
@@ -129,45 +189,45 @@ class SoundClassifier:
             return np.array(X, dtype=np.float32), np.array(y)
 
         try:
+            for path in [self.data_dir, self.valid_dir, self.test_dir]:
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Директория {path} не существует")
+
             print("\nЗагрузка тренировочных данных...")
-            self.X_train, self.y_train = load_from_dir(DATA_DIRS['train'])
-            self.y_train_encoded = self.le.fit_transform(self.y_train)
+            self.X, self.y = load_from_dir(self.data_dir)
+            self.y_encoded = self.le.fit_transform(self.y)
             
             print("\nЗагрузка валидационных данных...")
-            self.X_valid, self.y_valid = load_from_dir(DATA_DIRS['valid'])
-            self.y_valid_encoded = self.le.transform(self.y_valid)
+            self.X_valid, self.y_valid = load_from_dir(self.valid_dir)
+            self.y_encoded_valid = self.le.transform(self.y_valid)
             
             print("\nЗагрузка тестовых данных...")
-            self.X_test, self.y_test = load_from_dir(DATA_DIRS['test'])
-            self.y_test_encoded = self.le.transform(self.y_test)
+            self.X_test, self.y_test = load_from_dir(self.test_dir)
+            self.y_encoded_test = self.le.transform(self.y_test)
             
-            self.print_dataset_stats()
-
+            print("\nСтатистика датасета:")
+            self._print_dataset_stats("Тренировочные", self.y)
+            self._print_dataset_stats("Валидационные", self.y_valid)
+            self._print_dataset_stats("Тестовые", self.y_test)
+            
         except KeyboardInterrupt:
             print("\nПолное прерывание загрузки данных")
             self.running = False
             raise
             
         except Exception as e:
-            print(f"Ошибка при загрузке данных: {str(e)}")
+            print(f"Критическая ошибка при загрузке данных: {str(e)}")
             self.running = False
             raise
 
-    def print_dataset_stats(self):
-        """Вывод статистики датасета"""
-        def stats(X, y, name):
-            unique, counts = np.unique(y, return_counts=True)
-            print(f"{name} данные:")
-            for label, count in zip(unique, counts):
-                print(f"  {label}: {count} примеров")
-            print(f"Всего: {len(y)} примеров\n")
-            
-        stats(self.X_train, self.y_train, "Тренировочные")
-        stats(self.X_valid, self.y_valid, "Валидационные")
-        stats(self.X_test, self.y_test, "Тестовые")
+    def _print_dataset_stats(self, name, labels):
+        unique, counts = np.unique(labels, return_counts=True)
+        print(f"{name} данные:")
+        for label, count in zip(unique, counts):
+            print(f"  {label}: {count} примеров")
+        print(f"Всего: {len(labels)} примеров\n")
 
     def create_model(self):
-        """Создание архитектуры модели"""
         input_size = N_MFCC
         num_classes = len(self.le.classes_)
         self.model = nn.Sequential(
@@ -199,54 +259,130 @@ class SoundClassifier:
             verbose=True
         )
 
-    def train(self, num_epochs=10):
-        """Процесс обучения модели"""
-        X_train_tensor = torch.tensor(self.X_train, dtype=torch.float32)
-        y_train_tensor = torch.tensor(self.y_train_encoded, dtype=torch.long)
-        X_valid_tensor = torch.tensor(self.X_valid, dtype=torch.float32)
-        
+    def train(self, num_epochs=250):
+        X_tensor = torch.tensor(self.X, dtype=torch.float32)
+        y_tensor = torch.tensor(self.y_encoded, dtype=torch.long)
+    
+        train_losses = []
+        valid_losses = []
+        train_accuracies = []
+        valid_accuracies = []
+        learning_rates = []
+    
         try:
             for epoch in range(num_epochs):
                 if not self.running:
                     raise KeyboardInterrupt
-                    
-                # Обучение
+                
+            # Обучение
                 self.model.train()
                 self.optimizer.zero_grad()
-                outputs = self.model(X_train_tensor)
-                loss = self.criterion(outputs, y_train_tensor)
+                outputs = self.model(X_tensor)
+                loss = self.criterion(outputs, y_tensor)
                 loss.backward()
                 self.optimizer.step()
-                
-                # Валидация
+            
+            # Расчет точности тренировки
+                _, preds = torch.max(outputs, 1)
+                correct = (preds == y_tensor).sum().item()
+                train_accuracy = correct / len(y_tensor) * 100
+            
+                train_losses.append(loss.item())
+                train_accuracies.append(train_accuracy)
+            
+            # Валидация
                 self.model.eval()
                 with torch.no_grad():
-                    valid_outputs = self.model(X_valid_tensor)
-                    valid_loss = self.criterion(valid_outputs, torch.tensor(self.y_valid_encoded, dtype=torch.long))
-                    self.scheduler.step(valid_loss)
+                    valid_outputs = self.model(torch.tensor(self.X_valid, dtype=torch.float32))
+                    valid_loss = self.criterion(valid_outputs, torch.tensor(self.y_encoded_valid, dtype=torch.long))
                 
-                print(f"Эпоха [{epoch+1}/{num_epochs}] | Потеря: {loss.item():.4f} | Валидация: {valid_loss.item():.4f}")
+                # Расчет точности валидации
+                    _, valid_preds = torch.max(valid_outputs, 1)
+                    valid_correct = (valid_preds == torch.tensor(self.y_encoded_valid, dtype=torch.long)).sum().item()
+                    valid_accuracy = valid_correct / len(self.y_encoded_valid) * 100
                 
+                    valid_losses.append(valid_loss.item())
+                    valid_accuracies.append(valid_accuracy)
+            
+                learning_rates.append(self.optimizer.param_groups[0]['lr'])
+            
+                print(f"Эпоха [{epoch+1}/{num_epochs}] | "
+                    f"Потеря: {loss.item():.4f} | Валидация: {valid_loss.item():.4f} | "
+                    f"Точность: {train_accuracy:.2f}% | Валидационная точность: {valid_accuracy:.2f}%")
+
         except KeyboardInterrupt:
             print("\nОбучение прервано пользователем")
             self.running = False
+        
+        finally:
+            self.analyze_training(
+                train_losses, 
+                valid_losses,
+                train_accuracies,
+                valid_accuracies,
+                learning_rates
+            )
 
-    def save_model(self):
-        """Сохранение обученной модели"""
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'le_classes': self.le.classes_,
-            'input_size': N_MFCC,
-            'num_classes': len(self.le.classes_)
-        }, MODEL_PATH)
-        print(f"\nМодель сохранена в {MODEL_PATH}")
+
+    def analyze_training(self, train_losses, valid_losses, train_accuracies, valid_accuracies, learning_rates):
+        print("\n" + "="*60)
+        print("Детальный анализ обучения:")
+        print("="*60)
+    
+    # Анализ точности
+        max_train_acc = max(train_accuracies)
+        min_train_acc = min(train_accuracies)
+        final_train_acc = train_accuracies[-1]
+    
+        max_valid_acc = max(valid_accuracies)
+        min_valid_acc = min(valid_accuracies)
+        final_valid_acc = valid_accuracies[-1]
+    
+        print(f"\nТренировочная точность:")
+        print(f"  Начальная: {train_accuracies[0]:.2f}%")
+        print(f"  Максимальная: {max_train_acc:.2f}% (эпоха {train_accuracies.index(max_train_acc)+1})")
+        print(f"  Минимальная: {min_train_acc:.2f}% (эпоха {train_accuracies.index(min_train_acc)+1})")
+        print(f"  Финальная: {final_train_acc:.2f}%")
+    
+        print(f"\nВалидационная точность:")
+        print(f"  Начальная: {valid_accuracies[0]:.2f}%")
+        print(f"  Максимальная: {max_valid_acc:.2f}% (эпоха {valid_accuracies.index(max_valid_acc)+1})")
+        print(f"  Минимальная: {min_valid_acc:.2f}% (эпоха {valid_accuracies.index(min_valid_acc)+1})")
+        print(f"  Финальная: {final_valid_acc:.2f}%")
+    
+    # График точности
+        print("\nДинамика точности:")
+        for epoch, (train_acc, valid_acc) in enumerate(zip(train_accuracies, valid_accuracies)):
+            diff = valid_acc - train_acc
+            status = "↑↑" if diff > 5 else "↑↓" if diff < -5 else "≈"
+            print(f"Эпоха {epoch+1:2d}: Train {train_acc:6.2f}% | Valid {valid_acc:6.2f}% | Разница {diff:+5.2f}% {status}")
+    
+    # Рекомендации
+        print("\nРекомендации:")
+        if final_valid_acc < 60:
+            print("  ▸ Низкая точность! Попробуйте:")
+            print("    - Увеличить размер датасета")
+            print("    - Добавить аугментацию аудио")
+            print("    - Изменить архитектуру модели")
+        elif final_valid_acc < 80:
+            print("  ▸ Средняя точность. Возможные улучшения:")
+            print("    - Настроить гиперпараметры (LR, слои)")
+            print("    - Добавить регуляризацию")
+        else:
+            print("  ▸ Отличный результат! Модель готова к использованию")
+    
+        print("="*60 + "\n")
 
     def load_model(self):
-        """Загрузка модели из файла"""
         if os.path.exists(MODEL_PATH):
             try:
-                checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+                checkpoint = torch.load(
+                    MODEL_PATH,
+                    map_location='cpu',
+                    weights_only=False
+                )
                 self.le.classes_ = checkpoint['le_classes']
+                self.sample_rates = checkpoint.get('sample_rates', {})
                 
                 self.model = nn.Sequential(
                     nn.Linear(checkpoint['input_size'], 512),
@@ -268,12 +404,12 @@ class SoundClassifier:
                     nn.Linear(64, checkpoint['num_classes'])
                 )
                 self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.model.eval()
-                print("Модель успешно загружена")
+                print(f"Модель загружена из {MODEL_PATH}")
                 return True
             except Exception as e:
                 print(f"Ошибка загрузки модели: {str(e)}")
                 return False
+        print("Файл модели не найден")
         return False
 
     def init_network(self):
@@ -312,33 +448,43 @@ class SoundClassifier:
             print(f"Ошибка обработки пакета: {str(e)}")
 
     def predict(self, audio):
-        """Предсказание класса аудио"""
+   
         try:
-            if np.all(audio == 0):
+            if len(audio) == 0:
                 return {'class': 'error', 'confidence': 0, 'dBFS': -np.inf}
-
-            audio = librosa.util.normalize(audio)
             
-            mfcc = librosa.feature.mfcc(
-                y=audio,
-                sr=TARGET_SAMPLE_RATE,
-                n_mfcc=N_MFCC,
-                n_fft=2048,
-                hop_length=512
-            )
+        # Проверка на тишину
+            if np.all(np.abs(audio) < 1e-6):
+                return {'class': 'silence', 'confidence': 0, 'dBFS': -np.inf}
+
+        # Нормализация аудио
+            audio = librosa.util.normalize(audio)
+        
+        # Вычисление MFCC
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mfcc = librosa.feature.mfcc(
+                    y=audio,
+                    sr=TARGET_SAMPLE_RATE,
+                    n_mfcc=N_MFCC,
+                    n_fft=2048,
+                    hop_length=512
+                )
             mfcc = np.mean(mfcc.T, axis=0)
 
+        # Проверка на валидность MFCC
             if np.isnan(mfcc).any() or np.isinf(mfcc).any():
-                print("Обнаружены некорректные значения в MFCC")
                 return {'class': 'error', 'confidence': 0, 'dBFS': -np.inf}
 
-            inputs = torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0)
-            
+        # Предсказание
+            self.model.eval()  # Важно: переключаем в режим оценки
             with torch.no_grad():
+                inputs = torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0)
                 outputs = self.model(inputs)
                 proba = torch.softmax(outputs, dim=1)
                 conf, pred = torch.max(proba, 1)
-            
+        
+        # Расчет уровня звука
             rms = np.sqrt(np.mean(audio**2))
             dBFS = 20 * np.log10(rms) if rms > 0 else -np.inf
 
@@ -347,22 +493,23 @@ class SoundClassifier:
                 'confidence': conf.item(),
                 'dBFS': dBFS
             }
-            
+        
         except Exception as e:
             print(f"Ошибка предсказания: {str(e)}")
             return {'class': 'error', 'confidence': 0, 'dBFS': -np.inf}
 
+# Модификация метода process_audio()
     def process_audio(self):
-        """Основной цикл обработки аудио"""
         while self.running:
             try:
                 predictions = {}
                 for port in PORTS:
                     with self.lock:
                         buffer = self.audio_buffers[port]
-                        if len(buffer) >= TARGET_SAMPLE_RATE:
-                            audio = buffer[:TARGET_SAMPLE_RATE]
-                            self.audio_buffers[port] = buffer[TARGET_SAMPLE_RATE:]
+                    # Накопление 2 секунд аудио перед обработкой
+                        if len(buffer) >= BUFFER_SIZE:
+                            audio = buffer[-BUFFER_SIZE:]  # Берем последние 2 секунды
+                            self.audio_buffers[port] = np.array([], dtype=np.float32)
                             predictions[port] = self.predict(audio)
                 
                 if predictions:
